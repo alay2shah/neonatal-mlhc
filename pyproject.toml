@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "neonatal-mlhc"
+version = "0.1.0"
+description = "Neonatal Video Analysis MLHC Project"
+authors = ["alay2shah <alay0shah@gmail.com>"]
+readme = "README.md"
+packages = [{include = "neonatal_mlhc"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+google-cloud-storage = "^3.1.0"
+opencv-python = "^4.11.0.86"
+numpy = "^2.2.4"
+ffmpeg = "^1.4"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
