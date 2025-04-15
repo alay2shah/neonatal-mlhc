@@ -143,10 +143,11 @@ def main():
     """Example usage of the VideoDataLoader."""
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Extract random frames from videos in GCS bucket')
-    parser.add_argument('--num-frames', type=int, default=5,
+    parser.add_argument('--num-frames', type=int, default=50,
                       help='Total number of random frames to extract')
     parser.add_argument('--output-dir', type=str, 
-                      default=str(Path.home() / 'neonatal-mlhc/testing_data'),
+                    #   default=str(Path.home() / 'neonatal-mlhc/testing_data'),
+                        default=str(Path.cwd() / 'testing_data'),
                       help='Directory to save extracted frames')
     
     args = parser.parse_args()

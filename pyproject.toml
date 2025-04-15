@@ -10,8 +10,11 @@ packages = [{include = "neonatal_mlhc"}]
 python = "^3.11"
 google-cloud-storage = "^3.1.0"
 opencv-python = "^4.11.0.86"
-numpy = "^2.2.4"
+numpy = ">=1.23.0"  # Changed from ^2.2.4 to be compatible with ultralytics
 ffmpeg = "^1.4"
+pyyaml = "^6.0.2"
+ultralytics = "^8.3.108"
+filterpy = "^1.4.5"
 
 
 [build-system]

@@ -1,0 +1,13 @@
+testing_data
+.venv
+__pycache__
+*.pyc
+runs
+dataset
+*.mp4
+sort.py
+models.py
+*.pt
+*.pth
+yolov8n.pt
+
