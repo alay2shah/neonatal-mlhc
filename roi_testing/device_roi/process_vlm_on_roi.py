@@ -7,19 +7,23 @@ import cv2
 import time
 import matplotlib.pyplot as plt
 import moondream as md
+from plot_vlm_inference import plot_vlm_inference_over_time, plot_binary_predictions_over_time
+import csv
 
 # Load the Moondream model
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 print(f"Using device: {device}")
 
-# model = AutoModelForCausalLM.from_pretrained(
-#     "vikhyatk/moondream2",
-#     revision="2025-01-09",
-#     trust_remote_code=True
-# ).to(device)
-model_path = "../roi_testing/model/moondream-0_5b-int8.mf.gz"
-model = md.vl(model=model_path)
-# model = model.to(device)
+model = AutoModelForCausalLM.from_pretrained(
+    "vikhyatk/moondream2",
+    revision="2025-01-09",
+    trust_remote_code=True
+).to(device)
+# model_path = "../roi_testing/model/moondream-0_5b-int8.mf.gz"
+
+
+# model = md.vl(model=model_path)
+
 
 # Function to process ROIs and ask questions
 def process_img_and_predict(image_path, roi_type):
@@ -141,11 +145,20 @@ def process_roi_and_predict(image_path, model_path, roi_type=None, padding = 0.5
             print(f"Answer: {answer}")
 
 
-def plot_inference_speeds(roi_times, vlm_times, combined_times):
+def plot_inference_speeds(roi_times, vlm_times, combined_times, save_dir="./figures"):
     """
     Plot inference speeds for ROI detection, VLM inference, and combined processing,
     including average speeds in frames per second.
+    
+    Args:
+        roi_times (list): List of ROI detection times in seconds.
+        vlm_times (list): List of VLM inference times in seconds.
+        combined_times (list): List of combined processing times in seconds.
+        save_dir (str): Directory to save the figure.
     """
+    # Create the figures directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
     avg_roi = sum(roi_times) / len(roi_times)
     avg_vlm = sum(vlm_times) / len(vlm_times)
     avg_combined = sum(combined_times) / len(combined_times)
@@ -157,6 +170,15 @@ def plot_inference_speeds(roi_times, vlm_times, combined_times):
     print(f"Average ROI Detection Time: {avg_roi:.4f} seconds ({fps_roi:.2f} FPS)")
     print(f"Average VLM Inference Time: {avg_vlm:.4f} seconds ({fps_vlm:.2f} FPS)")
     print(f"Average Combined Time: {avg_combined:.4f} seconds ({fps_combined:.2f} FPS)")
+    
+    # Save the data to a CSV file
+    csv_filename = os.path.join(save_dir, "inference_speeds_comparison.csv")
+    with open(csv_filename, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Frame Index', 'ROI Detection Time (s)', 'VLM Inference Time (s)', 'Combined Time (s)'])
+        for i, (r, v, c) in enumerate(zip(roi_times, vlm_times, combined_times)):
+            writer.writerow([i, r, v, c])
+    print(f"Data saved to {csv_filename}")
 
     plt.figure(figsize=(10, 6))
     plt.plot(roi_times, label="ROI Detection", marker="o")
@@ -170,9 +192,15 @@ def plot_inference_speeds(roi_times, vlm_times, combined_times):
     plt.title("Inference Speeds for ROI Detector, VLM, and Combined")
     plt.legend()
     plt.grid()
+    plt.tight_layout()
+    
+    # Save the figure
+    filename = os.path.join(save_dir, "inference_speeds_comparison.png")
+    plt.savefig(filename, dpi=300)
     plt.show()
+    print(f"Figure saved to {filename}")
 
-def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_with_vlm.mp4", detection_interval=15, conf_threshold=0.25, vlm_interval=30, padding = 0.5):
+def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_with_vlm.mp4", detection_interval=15, conf_threshold=0.25, vlm_interval=30, padding=0.5, multi_frame=True, frames_to_capture=3, frame_interval=5):
     """
     Process a video, detect ROIs using YOLOv8, and make predictions using Moondream VLM.
     Keeps inference results visible at all times at the bottom of the video.
@@ -184,6 +212,10 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
         detection_interval (int): Run detection every N frames.
         conf_threshold (float): Confidence threshold for detections.
         vlm_interval (int): Run VLM predictions every N frames.
+        padding (float): Padding factor for ROI bounding boxes.
+        multi_frame (bool): Whether to use multiple frames for VLM prediction.
+        frames_to_capture (int): Number of frames to capture in a sequence.
+        frame_interval (int): Interval between frames in a sequence.
     """
     if not os.path.exists(video_path):
         print(f"Error: Video not found at {video_path}")
@@ -196,6 +228,8 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
     cap = cv2.VideoCapture(video_path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     # Initialize video writer
@@ -216,6 +250,17 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
     roi_times = []
     vlm_times = []
     combined_times = []
+    
+    # Track predictions and timestamps by class for plotting
+    prediction_timestamps = {0: [], 1: []}  # Class ID -> list of timestamps
+    prediction_answers = {0: [], 1: []}     # Class ID -> list of answers
+    prediction_questions = {0: "", 1: ""}   # Class ID -> question
+    prediction_frame_indices = {0: [], 1: []}  # Class ID -> list of frame indices (make sure this line exists)
+    cumulative_time = 0
+    
+    # For multi-frame processing
+    frame_buffer = {}  # cls_id -> list of frames
+    prediction_frame_indices = {0: [], 1: []}  # <-- Add this line
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -233,6 +278,8 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
         if frame_idx % detection_interval == 0:
             detections = detector.detect(frame, conf_threshold=conf_threshold)
             tracked_boxes = detections
+            # Reset frame buffer when we get new detections
+            frame_buffer = {0: [], 1: []}
         else:
             # Use optical flow tracking in between detection frames
             if prev_gray is not None and tracked_boxes:
@@ -240,59 +287,137 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
         roi_time = time.time() - start_time
         roi_times.append(roi_time)
 
+        # Collect frames for the buffer if we have detections
+        for box in tracked_boxes:
+            x1, y1, x2, y2, conf, cls_id = box
+            cls_id = int(cls_id)  # Ensure it's an integer for indexing
+            
+            # Skip invalid boxes
+            if x1 < 0 or y1 < 0 or x2 > frame.shape[1] or y2 > frame.shape[0] or x2 <= x1 or y2 <= y1:
+                continue
+                
+            # Apply padding to bounding box
+            h, w = frame.shape[:2]
+            roi_width = x2 - x1
+            roi_height = y2 - y1
+            padding_x = int(roi_width * padding)
+            padding_y = int(roi_height * padding)
+            
+            padded_x1 = max(0, x1 - padding_x)
+            padded_y1 = max(0, y1 - padding_y)
+            padded_x2 = min(w, x2 + padding_x)
+            padded_y2 = min(h, y2 + padding_y)
+            
+            # Crop the frame
+            cropped_frame = frame[int(padded_y1):int(padded_y2), int(padded_x1):int(padded_x2)]
+            if cropped_frame is None or cropped_frame.size == 0:
+                continue
+                
+            # Convert to PIL for VLM
+            pil_img = Image.fromarray(cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2RGB))
+            
+            # Initialize buffer for this class if needed
+            if cls_id not in frame_buffer:
+                frame_buffer[cls_id] = []
+                
+            # Add to buffer, keeping most recent frames
+            frame_buffer[cls_id].append((frame_idx, pil_img))
+            if len(frame_buffer[cls_id]) > frames_to_capture * frame_interval:
+                frame_buffer[cls_id].pop(0)  # Remove oldest frame
+
         # Measure VLM inference time
         vlm_time = 0
         if frame_idx % vlm_interval == 0:
-            for box in tracked_boxes:
-                x1, y1, x2, y2, conf, cls_id = box
-                
-                h, w = frame.shape[:2]
-                roi_width = x2 - x1
-                roi_height = y2 - y1
-                padding_x = int(roi_width * padding)
-                padding_y = int(roi_height * padding)
-                
-                # Apply padding with boundary checks
-                padded_x1 = max(0, x1 - padding_x)
-                padded_y1 = max(0, y1 - padding_y)
-                padded_x2 = min(w, x2 + padding_x)
-                padded_y2 = min(h, y2 + padding_y)
-
-                # Validate bounding box coordinates
-                if x1 < 0 or y1 < 0 or x2 > frame.shape[1] or y2 > frame.shape[0] or x2 <= x1 or y2 <= y1:
-                    print(f"Warning: Invalid bounding box coordinates: {x1}, {y1}, {x2}, {y2}")
-                    continue
-
-                # Crop the frame
-                cropped_frame = frame[int(padded_y1):int(padded_y2), int(padded_x1):int(padded_x2)]
-                if cropped_frame is None or cropped_frame.size == 0:
-                    print(f"Warning: Cropped frame is empty for box: {x1}, {y1}, {x2}, {y2}")
-                    continue
-
-                # Convert cropped frame to PIL Image
-                image = Image.fromarray(cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2RGB))
-
-                # Define questions based on class ID
-                questions = []
-                if cls_id == 0:  # Bag
-                    questions.append("Is the bag getting filled with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no.")
-                elif cls_id == 1:  # Intubator
-                    questions.append("Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no.")
-
-                # Ask questions and get predictions
-                start_time = time.time()
-                for question in questions:
-                    answer = model.query(image, question)["answer"]
+            for cls_id in list(frame_buffer.keys()):
+                answer_to_store = None
+                # Multi-frame
+                if multi_frame and len(frame_buffer[cls_id]) >= frames_to_capture:
+                    # Select frames at the specified interval
+                    selected_frames = []
+                    for i in range(frames_to_capture):
+                        # Take every frame_interval frame from the end of the buffer
+                        idx = -(1 + i * frame_interval)
+                        if abs(idx) <= len(frame_buffer[cls_id]):
+                            selected_frames.append(frame_buffer[cls_id][idx][1])  # Get the PIL image
+                    
+                    if len(selected_frames) == frames_to_capture:
+                        # Define questions based on class ID
+                        if cls_id == 0:  # Bag
+                            question = "Is the bag getting filled with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
+                            prediction_questions[0] = question
+                        elif cls_id == 1:  # Intubator
+                            question = "Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no."
+                            prediction_questions[1] = question
+                        else:
+                            continue
+                            
+                        # Process each selected frame and combine results
+                        start_time = time.time()
+                        answers = []
+                        
+                        print(f"Processing {len(selected_frames)} frames for class {cls_id}")
+                        for i, img in enumerate(selected_frames):
+                            answer = model.query(img, question)["answer"]
+                            answers.append(answer)
+                            print(f"  Frame {i+1}: {answer}")
+                        
+                        # Combine answers - use majority vote for yes/no answers
+                        yes_count = sum(1 for a in answers if a.lower() in ["yes", "1"])
+                        no_count = sum(1 for a in answers if a.lower() in ["no", "0"])
+                        
+                        if yes_count > no_count:
+                            answer_to_store = "Yes (majority vote)"
+                        elif no_count > yes_count:
+                            answer_to_store = "No (majority vote)"
+                        else:
+                            answer_to_store = answers[-1] + " (tie)"
+                            
+                        # Update the last inference result for this class
+                        last_inference[cls_id] = question
+                        last_answers[cls_id] = answer_to_store
+                        
+                        # Store for plotting
+                        prediction_timestamps[cls_id].append(cumulative_time)
+                        prediction_answers[cls_id].append(answer_to_store)
+                        
+                        vlm_time += time.time() - start_time
+                        print(f"Frame {frame_idx}: Q: {question} A: {answer_to_store} (multi-frame)")
+                # Single-frame
+                elif cls_id in frame_buffer and frame_buffer[cls_id]:
+                    _, img = frame_buffer[cls_id][-1]
+                    
+                    # Define questions based on class ID
+                    if cls_id == 0:  # Bag
+                        question = "Is the bag getting filled with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
+                        prediction_questions[0] = question
+                    elif cls_id == 1:  # Intubator
+                        question = "Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no."
+                        prediction_questions[1] = question
+                    else:
+                        continue
+                        
+                    start_time = time.time()
+                    answer = model.query(img, question)["answer"]
+                    answer_to_store = answer
                     
                     # Update the last inference result for this class
                     last_inference[cls_id] = question
-                    last_answers[cls_id] = answer
+                    last_answers[cls_id] = answer_to_store
                     
-                    print(f"Frame {frame_idx}: Q: {question} A: {answer}")
-                vlm_time += time.time() - start_time
-        vlm_times.append(vlm_time)
+                    # Store for plotting
+                    prediction_timestamps[cls_id].append(cumulative_time)
+                    prediction_answers[cls_id].append(answer_to_store)
+                    
+                    vlm_time += time.time() - start_time
+                    print(f"Frame {frame_idx}: Q: {question} A: {answer_to_store} (single frame)")
 
-        # Measure combined time
+                # Only append if a prediction was made
+                if answer_to_store is not None:
+                    prediction_frame_indices[cls_id].append(frame_idx)
+                    prediction_answers[cls_id].append(answer_to_store)
+
+        vlm_times.append(vlm_time)
+        cumulative_time += vlm_time + roi_time
         combined_times.append(roi_time + vlm_time)
 
         # Draw ROIs for all tracked boxes
@@ -340,6 +465,15 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
             
             y_position += 60  # Move down for the next class
 
+        # Display information about multi-frame processing
+        if multi_frame:
+            for cls_id in frame_buffer:
+                if frame_buffer[cls_id]:
+                    class_name = "Bag" if cls_id == 0 else "Intubator"
+                    buffer_info = f"{class_name} frames: {len(frame_buffer[cls_id])}/{frames_to_capture * frame_interval}"
+                    cv2.putText(display_frame, buffer_info, (10, 60 + cls_id * 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
         # Save current frame for optical flow
         prev_gray = curr_gray.copy()
         frame_idx += 1
@@ -359,6 +493,43 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
 
     # Plot inference speeds
     plot_inference_speeds(roi_times, vlm_times, combined_times)
+    plot_vlm_inference_over_time(vlm_times, "VLM and ROI")
+    
+    # Create a base filename for figures based on the video name
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    figures_dir = f"./figures/{video_name}/roi"
+    os.makedirs(figures_dir, exist_ok=True)
+    
+    # Add debug printing to see what's in the prediction data
+    for cls_id in [0, 1]:
+        class_name = "Bag" if cls_id == 0 else "Intubator"
+        print(f"\n{class_name} predictions:")
+        print(f"  Frame indices: {prediction_frame_indices[cls_id]}")
+        print(f"  Answers: {prediction_answers[cls_id]}")
+        print(f"  Question: {prediction_questions[cls_id]}")
+    
+    # Plot predictions for each class
+    for cls_id in [0, 1]:
+        class_name = "Bag" if cls_id == 0 else "Intubator"
+        if prediction_frame_indices[cls_id]:  # Only plot if we have data
+            try:
+                # Use the correct plotting function with proper parameters
+                plot_binary_predictions_over_time(
+                    prediction_frame_indices[cls_id],  # Use frame indices directly
+                    prediction_answers[cls_id],
+                    "VLM and ROI", 
+                    prediction_questions[cls_id],
+                    class_name,
+                    save_dir=figures_dir,
+                    fps=fps,
+                    use_frame_indices=True  # Important: Tell the function to convert indices to time
+                )
+            except Exception as e:
+                print(f"Error plotting binary predictions for {class_name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+
 
 def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", vlm_interval=30):
     """
@@ -389,7 +560,7 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
     # The question to ask for every frame
-    question = "Is the bag getting filled with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
+    question = "Is the bag getting pumped with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
     
     # Track the last answer
     last_answer = "No inference yet"
@@ -400,6 +571,15 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
 
     # Performance tracking
     vlm_times = []
+    roi_times = []  # For compatibility with plot function (empty for VLM-only)
+    combined_times = []  # For compatibility with plot function
+    
+    # Track predictions and timestamps for plotting
+    prediction_timestamps = []
+    prediction_answers = []
+    prediction_questions = {0: question}  # For compatibility with other functions
+    cumulative_time = 0
+    video_time_timestamps = []  # Separate storage for video timestamps
     
     # Process frames
     frame_idx = 0
@@ -407,6 +587,10 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
     print(f"Total frames: {total_frames}")
     print(f"Running VLM every {vlm_interval} frames")
     
+    # VLM time for non-inference frames (set to 0)
+    vlm_time = 0
+    prediction_frame_indices = []  # <-- Ensure this is initialized
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -432,7 +616,28 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
             vlm_time = time.time() - start_time
             vlm_times.append(vlm_time)
             
+            # Store for plotting
+            cumulative_time += vlm_time
+            prediction_timestamps.append(cumulative_time)
+            prediction_answers.append(answer)
+            prediction_frame_indices.append(frame_idx)  # <-- Append frame index here
+            
+            # Also store video time (frame index / fps)
+            video_time = frame_idx / fps
+            video_time_timestamps.append(video_time)
+            
             print(f"Frame {frame_idx}: Q: {question} A: {answer} ({vlm_time:.2f}s)")
+            
+            # Add empty ROI time for this frame
+            roi_times.append(0)
+            # Combined time is same as VLM time since ROI time is 0
+            combined_times.append(vlm_time)
+        else:
+            # For frames without inference, add zeros to keep arrays aligned
+            if len(vlm_times) > 0:  # Only if we've done at least one inference
+                vlm_times.append(0)
+                roi_times.append(0)
+                combined_times.append(0)
         
         # Create a dark semi-transparent overlay for text at the bottom
         overlay = display_frame.copy()
@@ -461,7 +666,7 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
         # Write frame to video
         writer.write(display_frame)
         
-        # Display the frame
+    # Display the frame
         cv2.imshow('Video with VLM Only', display_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -472,25 +677,64 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
     cap.release()
     writer.release()
     cv2.destroyAllWindows()
-    
+
+    # Always plot binary predictions after processing
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    figures_dir = f"./figures/{video_name}/vlm_only"
+    os.makedirs(figures_dir, exist_ok=True)
+    try:
+        plot_binary_predictions_over_time(
+            prediction_frame_indices,
+            prediction_answers,
+            "VLM Only",
+            question,
+            save_dir=figures_dir,
+            fps=fps,
+            use_frame_indices=True
+        )
+    except Exception as e:
+        print(f"Error plotting binary predictions: {e}")
+
     # Calculate average inference time
     if vlm_times:
-        avg_vlm_time = sum(vlm_times) / len(vlm_times)
+        # Filter out zero values for average calculation
+        non_zero_vlm_times = [t for t in vlm_times if t > 0]
+        avg_vlm_time = sum(non_zero_vlm_times) / len(non_zero_vlm_times) if non_zero_vlm_times else 0
+        
         print(f"Processing completed. Output saved to {output_path}.")
         print(f"Average VLM inference time: {avg_vlm_time:.4f} seconds")
         
-        # Plot inference times
-        plt.figure(figsize=(10, 6))
-        plt.plot(vlm_times, label="VLM Inference Time", marker="o")
-        plt.axhline(y=avg_vlm_time, color='r', linestyle='-', label=f"Average: {avg_vlm_time:.4f}s")
-        plt.xlabel("Frame Index")
-        plt.ylabel("Inference Time (seconds)")
-        plt.title("VLM Inference Times")
-        plt.legend()
-        plt.grid()
-        plt.show()
+        # Create a base filename for figures based on the video name
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        figures_dir = f"./figures/{video_name}/vlm_only"
+        os.makedirs(figures_dir, exist_ok=True)
+        
+        try:
+            # Try to plot inference times
+            plot_inference_speeds(roi_times, non_zero_vlm_times, combined_times, save_dir=figures_dir)
+        except Exception as e:
+            print(f"Error plotting inference speeds: {e}")
+            
+        try:
+            # Try to plot VLM inference over time
+            plot_vlm_inference_over_time(non_zero_vlm_times, "VLM Only", save_dir=figures_dir)
+        except Exception as e:
+            print(f"Error plotting VLM inference over time: {e}")
+        
+        try:
+            # Create a dictionary with the results for plotting
+            results_data = {
+                'timestamps': prediction_timestamps,
+                'vlm_only_predictions': prediction_answers
+            }
+            
+            # Return both the inference times and results for plotting
+            return (vlm_times, prediction_timestamps, prediction_answers)
+        except Exception as e:
+            print(f"Error organizing results data: {e}")
     else:
         print("No frames were processed with VLM.")
+        return ([], [], [])
 
 # Example usage
 if __name__ == "__main__":
@@ -508,10 +752,40 @@ if __name__ == "__main__":
     # process_img_and_predict(test_image_path, "bag")
 
     # Process with ROI detection
-    roi_output_path = f"./output_with_roi_{video_name}_0_5_b.mp4"
+    roi_output_path = f"./output_with_roi_{video_name}_2b_multiframe_2.mp4"
     process_video_with_vlm_and_roi(VIDEO_PATH, MODEL_PATH, output_path=roi_output_path)
     
     # Process with VLM only
-    vlm_output_path = f"./output_vlm_only_{video_name}_0_5_b.mp4"
-    process_video_with_vlm_only(VIDEO_PATH, output_path=vlm_output_path)
+    # vlm_output_path = f"./output_vlm_only_{video_name}_0_5_b.mp4"
+    # process_video_with_vlm_only(VIDEO_PATH, output_path=vlm_output_path)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
