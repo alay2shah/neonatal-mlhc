@@ -630,7 +630,7 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
             
             # Add empty ROI time for this frame
             roi_times.append(0)
-            # Combined time is same as VLM time since ROI time is 0
+             # Combined time is same as VLM time since ROI time is 0
             combined_times.append(vlm_time)
         else:
             # For frames without inference, add zeros to keep arrays aligned
@@ -643,7 +643,7 @@ def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", v
         overlay = display_frame.copy()
         cv2.rectangle(overlay, (0, height - text_area_height), (width, height), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, display_frame, 0.3, 0, display_frame)
-
+        
         # Add inference results at the bottom
         y_position = height - text_area_height + bottom_padding + 20
         result_text = f"Q: {question}"
