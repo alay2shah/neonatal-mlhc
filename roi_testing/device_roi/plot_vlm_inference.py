@@ -3,31 +3,6 @@ import numpy as np
 import os
 import csv
 
-def plot_vlm_inference_over_time(vlm_times, approach_name):
-    """
-    Plot VLM inference times over time in minutes and seconds.
-
-    Args:
-        vlm_times (list): List of VLM inference times in seconds.
-        approach_name (str): Name of the approach (e.g., "VLM Only" or "VLM and ROI").
-    """
-    # Convert frame indices to cumulative time in minutes and seconds
-    cumulative_time = [sum(vlm_times[:i+1]) for i in range(len(vlm_times))]
-    minutes = [int(t // 60) for t in cumulative_time]
-    seconds = [t % 60 for t in cumulative_time]
-
-    # Plot the inference times
-    plt.figure(figsize=(10, 6))
-    plt.plot(cumulative_time, vlm_times, label=f"{approach_name} Inference Time", marker="o")
-    plt.xlabel("Cumulative Time (minutes:seconds)")
-    plt.ylabel("Inference Time (seconds)")
-    plt.title(f"VLM Inference Times Over Time ({approach_name})")
-    plt.xticks(cumulative_time, [f"{m}:{s:02}" for m, s in zip(minutes, seconds)], rotation=45)
-    plt.axhline(y=sum(vlm_times) / len(vlm_times), color='r', linestyle='--', label="Average Inference Time")
-    plt.legend()
-    plt.grid()
-    plt.tight_layout()
-    plt.show()
 
 def plot_binary_predictions_over_time(timestamps, predictions, approach_name, question, class_name=None, save_dir="./figures", fps=30, frame_interval=30, use_frame_indices=False):
     """

@@ -10,4 +10,6 @@ models.py
 *.pt
 *.pth
 yolov8n.pt
-
+figures
+roi_testing/model/moondream-0_5b-int8.mf.gz
+model

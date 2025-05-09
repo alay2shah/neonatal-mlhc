@@ -7,8 +7,9 @@ import cv2
 import time
 import matplotlib.pyplot as plt
 import moondream as md
-from plot_vlm_inference import plot_vlm_inference_over_time, plot_binary_predictions_over_time
+from plot_vlm_inference import  plot_binary_predictions_over_time
 import csv
+import numpy as np
 
 # Load the Moondream model
 device = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -200,7 +201,10 @@ def plot_inference_speeds(roi_times, vlm_times, combined_times, save_dir="./figu
     plt.show()
     print(f"Figure saved to {filename}")
 
-def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_with_vlm.mp4", detection_interval=15, conf_threshold=0.25, vlm_interval=30, padding=0.5, multi_frame=True, frames_to_capture=3, frame_interval=5):
+def process_video_with_vlm_and_roi(
+    video_path, model_path, output_path="output_with_vlm.mp4", detection_interval=15, conf_threshold=0.25,
+    vlm_interval=30, padding=0.5, multi_frame=True, frames_to_capture=15, frame_interval=3, use_grid=False, plots=True
+):
     """
     Process a video, detect ROIs using YOLOv8, and make predictions using Moondream VLM.
     Keeps inference results visible at all times at the bottom of the video.
@@ -216,6 +220,8 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
         multi_frame (bool): Whether to use multiple frames for VLM prediction.
         frames_to_capture (int): Number of frames to capture in a sequence.
         frame_interval (int): Interval between frames in a sequence.
+        use_grid (bool): If True, use a grid of 4 images for inference.
+        plots (bool): If True, plot inference speeds and binary predictions.
     """
     if not os.path.exists(video_path):
         print(f"Error: Video not found at {video_path}")
@@ -259,13 +265,40 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
     cumulative_time = 0
     
     # For multi-frame processing
-    frame_buffer = {}  # cls_id -> list of frames
-    prediction_frame_indices = {0: [], 1: []}  # <-- Add this line
+    frame_buffer = {}  # cls_id -> list of (frame_idx, PIL image)
+    all_frames_buffer = {}  # Store more frames for grid processing
+    prediction_frame_indices = {0: [], 1: []}
+    
+    # If using grid, make sure to collect enough frames
+    grid_frames_needed = 4
+    frames_to_keep = max(vlm_interval, grid_frames_needed * 15) if use_grid else vlm_interval
 
+    # Track frames since last VLM inference for each class
+    last_vlm_frame = 0
+    
+    # For multi-frame processing
+    frame_buffer = {}  # cls_id -> list of (frame_idx, PIL image)
+    all_frames_buffer = {}  # Store more frames for grid processing - will be reset at each VLM interval
+    prediction_frame_indices = {0: [], 1: []}
+
+
+    # Keep track of the starting frame for the current VLM interval
+    vlm_interval_start = 0
+    
+    # Create buffers that are specific to the current VLM interval
+    current_interval_buffers = {0: [], 1: []}
+    
+    
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
+        
+        # Start of new VLM interval - reset buffers
+        if frame_idx % vlm_interval == 0:
+            vlm_interval_start = frame_idx
+            current_interval_buffers = {0: [], 1: []}
+            print(f"Starting new VLM interval at frame {frame_idx}")
 
         # Create a larger frame with space for text at the bottom
         display_frame = frame.copy()
@@ -273,13 +306,18 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
         # Convert frame to grayscale for optical flow
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        # Reset all_frames_buffer at each VLM interval
+        if frame_idx % vlm_interval == 0:
+            all_frames_buffer = {0: [], 1: []}
+            last_vlm_frame = frame_idx
+
         # Measure ROI detection time
         start_time = time.time()
         if frame_idx % detection_interval == 0:
             detections = detector.detect(frame, conf_threshold=conf_threshold)
             tracked_boxes = detections
             # Reset frame buffer when we get new detections
-            frame_buffer = {0: [], 1: []}
+            # frame_buffer = {0: [], 1: []}
         else:
             # Use optical flow tracking in between detection frames
             if prev_gray is not None and tracked_boxes:
@@ -287,6 +325,11 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
         roi_time = time.time() - start_time
         roi_times.append(roi_time)
 
+        # Init per-class buffers if needed
+        for cls_id in [0, 1]:
+            if cls_id not in all_frames_buffer:
+                all_frames_buffer[cls_id] = []
+        
         # Collect frames for the buffer if we have detections
         for box in tracked_boxes:
             x1, y1, x2, y2, conf, cls_id = box
@@ -318,104 +361,206 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
             
             # Initialize buffer for this class if needed
             if cls_id not in frame_buffer:
-                frame_buffer[cls_id] = []
-                
-            # Add to buffer, keeping most recent frames
+                frame_buffer[cls_id] = []                
             frame_buffer[cls_id].append((frame_idx, pil_img))
             if len(frame_buffer[cls_id]) > frames_to_capture * frame_interval:
-                frame_buffer[cls_id].pop(0)  # Remove oldest frame
+                frame_buffer[cls_id].pop(0)
+                
+            # Also add to all_frames_buffer for grid
+            all_frames_buffer[cls_id].append((frame_idx, pil_img))
+            if len(all_frames_buffer[cls_id]) > frames_to_keep:
+                all_frames_buffer[cls_id].pop(0)
 
-        # Measure VLM inference time
+            # Only add frames that are part of the current VLM interval
+            if frame_idx >= vlm_interval_start:
+                cls_id = int(cls_id)
+                if cls_id not in current_interval_buffers:
+                    current_interval_buffers[cls_id] = []
+                
+                # Store the current ROI frame
+                current_interval_buffers[cls_id].append((frame_idx, pil_img))
+                
+                # Debug visualization to show buffer growth
+                class_name = "Bag" if cls_id == 0 else "Intubator"
+                cv2.putText(display_frame, f"{class_name} buffer: {len(current_interval_buffers[cls_id])} frames", 
+                           (10, 30 + cls_id * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        # # Measure VLM inference time
+        # vlm_time = 0
+        # if frame_idx % vlm_interval == 0:
+        #     print(f"Running VLM inference at frame {frame_idx}...")
+            
+        #     # Debug print all buffer sizes
+        #     for cls_id in [0, 1]:
+        #         buffer_size = len(all_frames_buffer.get(cls_id, []))
+        #         print(f"Frame {frame_idx}: Class {cls_id} has {buffer_size} frames in buffer")
+            
+        #     for cls_id in list(all_frames_buffer.keys()):
+        #         answer_to_store = None
+                
+        #         # Skip if no ROIs were detected for this class
+        #         if not all_frames_buffer.get(cls_id, []):
+        #             print(f"No {('Bag' if cls_id == 0 else 'Intubator')} detected in this interval, skipping...")
+        #             continue
+                
+        #         # --- Use grid if requested ---
+        #         if use_grid:
+        #             buffer_items = all_frames_buffer.get(cls_id, [])
+        #             if len(buffer_items) >= 1:  # At least one frame is needed
+        #                 # Determine how many frames to use (up to 4)
+        #                 grid_frames_needed = min(4, len(buffer_items))
+                        
+        #                 # Always select frames evenly spaced throughout the buffer
+        #                 if len(buffer_items) >= grid_frames_needed:
+        #                     # Use numpy linspace to get evenly spaced indices
+        #                     indices = np.linspace(0, len(buffer_items)-1, grid_frames_needed, dtype=int)
+        #                     selected_items = [buffer_items[i] for i in indices]
+                            
+        #                     # Debug print the selected indices
+        #                     frame_nums = [item[0] for item in selected_items]
+        #                     print(f"Selected {grid_frames_needed} frames at indices: {frame_nums} from buffer of {len(buffer_items)}")
+                            
+        #                     # Extract just the PIL images
+        #                     images_for_grid = [item[1] for item in selected_items]
+                            
+        #                     # Create question based on class
+        #                     if cls_id == 0:  # Bag
+        #                         # question = "Is the blue bag being squeezed by hands and filled with air? Answer as 1 for yes, 0 for no."
+        #                         question = "Is a gloved hand grabbing the bag and either squeezing it or filling it with air? Answer as 1 for yes, 0 for no."
+        #                         prediction_questions[0] = question
+        #                     else:  # Intubator
+        #                         question = "Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no."
+        #                         prediction_questions[1] = question
+                            
+        #                     # Create and save the grid image
+        #                     try:
+        #                         grid_img = create_image_grid(images_for_grid)
+        #                         grid_path = os.path.join(debug_dir, f"grid_cls{cls_id}_frame{frame_idx}.jpg")
+        #                         grid_img.save(grid_path)
+        #                         print(f"Saved grid with {len(images_for_grid)} images to {grid_path}")
+                                
+        #                         # Process with VLM
+        #                         start_time = time.time()
+        #                         answer_to_store = process_image_grid(model, images_for_grid, question)
+        #                         vlm_time += time.time() - start_time
+                                
+        #                         # Update results
+        #                         last_inference[cls_id] = question
+        #                         last_answers[cls_id] = answer_to_store
+        #                         print(f"Frame {frame_idx}: Grid Q: {question} A: {answer_to_store}")
+        #                     except Exception as e:
+        #                         print(f"Error creating/processing grid: {e}")
+        #                         import traceback
+        #                         traceback.print_exc()
+                
+        #         # Only store prediction if we made one
+        #         if answer_to_store is not None:
+        #             prediction_frame_indices[cls_id].append(frame_idx)
+        #             prediction_answers[cls_id].append(answer_to_store)
+                    
+        #     # Clear frame buffers after processing
+        #     all_frames_buffer = {0: [], 1: []}
+
+        # Run VLM at the end of each interval
         vlm_time = 0
-        if frame_idx % vlm_interval == 0:
-            for cls_id in list(frame_buffer.keys()):
-                answer_to_store = None
-                # Multi-frame
-                if multi_frame and len(frame_buffer[cls_id]) >= frames_to_capture:
-                    # Select frames at the specified interval
-                    selected_frames = []
-                    for i in range(frames_to_capture):
-                        # Take every frame_interval frame from the end of the buffer
-                        idx = -(1 + i * frame_interval)
-                        if abs(idx) <= len(frame_buffer[cls_id]):
-                            selected_frames.append(frame_buffer[cls_id][idx][1])  # Get the PIL image
+        if frame_idx > 0 and (frame_idx + 1) % vlm_interval == 0:
+            print(f"Running VLM inference at frame {frame_idx} (end of interval)")
+            
+            # Debug print buffer contents
+            for cls_id in [0, 1]:
+                class_name = "Bag" if cls_id == 0 else "Intubator"
+                buffer_len = len(current_interval_buffers.get(cls_id, []))
+                print(f"Frame {frame_idx}: {class_name} has {buffer_len} frames in current interval buffer")
+                
+                # Process each class if we have frames
+                if buffer_len > 0:
+                    buffer_items = current_interval_buffers[cls_id]
                     
-                    if len(selected_frames) == frames_to_capture:
-                        # Define questions based on class ID
-                        if cls_id == 0:  # Bag
-                            question = "Is the bag getting filled with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
-                            prediction_questions[0] = question
-                        elif cls_id == 1:  # Intubator
-                            question = "Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no."
-                            prediction_questions[1] = question
-                        else:
-                            continue
+                    if use_grid:
+                        # We want to select 4 frames evenly distributed across the interval
+                        grid_size = min(4, buffer_len)
+                        
+                        if buffer_len >= grid_size:
+                            # Select frames evenly distributed through the buffer
+                            indices = np.linspace(0, buffer_len-1, grid_size, dtype=int)
+                            selected_items = [buffer_items[i] for i in indices]
+                            selected_frames = [item[1] for item in selected_items]
+                            frame_indices = [item[0] for item in selected_items]
                             
-                        # Process each selected frame and combine results
-                        start_time = time.time()
-                        answers = []
-                        
-                        print(f"Processing {len(selected_frames)} frames for class {cls_id}")
-                        for i, img in enumerate(selected_frames):
-                            answer = model.query(img, question)["answer"]
-                            answers.append(answer)
-                            print(f"  Frame {i+1}: {answer}")
-                        
-                        # Combine answers - use majority vote for yes/no answers
-                        yes_count = sum(1 for a in answers if a.lower() in ["yes", "1"])
-                        no_count = sum(1 for a in answers if a.lower() in ["no", "0"])
-                        
-                        if yes_count > no_count:
-                            answer_to_store = "Yes (majority vote)"
-                        elif no_count > yes_count:
-                            answer_to_store = "No (majority vote)"
-                        else:
-                            answer_to_store = answers[-1] + " (tie)"
+                            print(f"Selected {grid_size} frames at indices {frame_indices} from buffer of {buffer_len} frames")
                             
-                        # Update the last inference result for this class
-                        last_inference[cls_id] = question
-                        last_answers[cls_id] = answer_to_store
-                        
-                        # Store for plotting
-                        prediction_timestamps[cls_id].append(cumulative_time)
-                        prediction_answers[cls_id].append(answer_to_store)
-                        
-                        vlm_time += time.time() - start_time
-                        print(f"Frame {frame_idx}: Q: {question} A: {answer_to_store} (multi-frame)")
-                # Single-frame
-                elif cls_id in frame_buffer and frame_buffer[cls_id]:
-                    _, img = frame_buffer[cls_id][-1]
-                    
-                    # Define questions based on class ID
-                    if cls_id == 0:  # Bag
-                        question = "Is the bag getting filled with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
-                        prediction_questions[0] = question
-                    elif cls_id == 1:  # Intubator
-                        question = "Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no."
-                        prediction_questions[1] = question
+                            # Save individual frames for debugging
+                            # for i, img in enumerate(selected_frames):
+                            #     img_debug_dir = os.path.join(debug_dir, f"interval_{frame_idx//vlm_interval}_cls{cls_id}")
+                            #     os.makedirs(img_debug_dir, exist_ok=True)
+                            #     img.save(os.path.join(img_debug_dir, f"frame_{i}_idx_{frame_indices[i]}.jpg"))
+                            
+                            # Define question based on class
+                            if cls_id == 0:  # Bag
+                                # question = "Is the blue bag being squeezed by hands and filled with air? Answer as 1 for yes, 0 for no."
+                                question = "Is a gloved hand squeezing the bag tightly? Answer as 1 for yes, 0 for no."
+                                prediction_questions[0] = question
+                            else:  # Intubator
+                                question = "Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no."
+                                prediction_questions[1] = question
+                            
+                            # Create and process grid
+                            try:
+                                grid_img = create_image_grid(selected_frames)
+                                # grid_path = os.path.join(debug_dir, f"grid_cls{cls_id}_interval_{frame_idx//vlm_interval}.jpg")
+                                # grid_img.save(grid_path)
+                                
+                                start_time = time.time()
+                                answer = process_image_grid(model, selected_frames, question)
+                                vlm_time += time.time() - start_time
+                                
+                                last_inference[cls_id] = question
+                                last_answers[cls_id] = answer
+                                
+                                # Save prediction for plotting
+                                prediction_frame_indices[cls_id].append(frame_idx)
+                                prediction_answers[cls_id].append(answer)
+                                
+                                print(f"Frame {frame_idx}: {class_name} grid analysis: {answer}")
+                            except Exception as e:
+                                print(f"Error processing grid: {e}")
+                                import traceback
+                                traceback.print_exc()
                     else:
-                        continue
-                        
-                    start_time = time.time()
-                    answer = model.query(img, question)["answer"]
-                    answer_to_store = answer
-                    
-                    # Update the last inference result for this class
-                    last_inference[cls_id] = question
-                    last_answers[cls_id] = answer_to_store
-                    
-                    # Store for plotting
-                    prediction_timestamps[cls_id].append(cumulative_time)
-                    prediction_answers[cls_id].append(answer_to_store)
-                    
-                    vlm_time += time.time() - start_time
-                    print(f"Frame {frame_idx}: Q: {question} A: {answer_to_store} (single frame)")
-
-                # Only append if a prediction was made
-                if answer_to_store is not None:
-                    prediction_frame_indices[cls_id].append(frame_idx)
-                    prediction_answers[cls_id].append(answer_to_store)
-
+                        # When not using grid, directly use the latest ROI
+                        try:
+                            # Select the most recent frame from the buffer
+                            latest_frame_idx, latest_roi_img = buffer_items[-1]
+                            
+                            # Define question based on class
+                            if cls_id == 0:  # Bag
+                                question = "Is the blue bag getting filled with air or being squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
+                                prediction_questions[0] = question
+                            else:  # Intubator
+                                question = "Is the intubator at an angle being inserted into the baby's mouth? Answer as 1 for yes, 0 for no."
+                                prediction_questions[1] = question
+                            
+                            # Process with VLM directly (single image)
+                            start_time = time.time()
+                            answer = model.query(latest_roi_img, question)["answer"]
+                            vlm_time += time.time() - start_time
+                            
+                            # Update results
+                            last_inference[cls_id] = question
+                            last_answers[cls_id] = answer
+                            
+                            # Save prediction for plotting
+                            prediction_frame_indices[cls_id].append(frame_idx)
+                            prediction_answers[cls_id].append(answer)
+                            
+                            print(f"Frame {frame_idx}: {class_name} direct analysis: Q: {question} A: {answer}")
+                            
+                   
+                        except Exception as e:
+                            print(f"Error in direct ROI processing: {e}")
+                            import traceback
+                            traceback.print_exc()
+        
         vlm_times.append(vlm_time)
         cumulative_time += vlm_time + roi_time
         combined_times.append(roi_time + vlm_time)
@@ -491,14 +636,36 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
     cv2.destroyAllWindows()
     print(f"Processing completed. Output saved to {output_path}.")
 
-    # Plot inference speeds
-    plot_inference_speeds(roi_times, vlm_times, combined_times)
-    plot_vlm_inference_over_time(vlm_times, "VLM and ROI")
+    if plots == True:
+        # Plot inference speeds
+        plot_inference_speeds(roi_times, vlm_times, combined_times)
+
+        # Create a base filename for figures based on the video name
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        figures_dir = f"./figures/{video_name}/roi"
+        os.makedirs(figures_dir, exist_ok=True)
+            # Plot predictions for each class
+        for cls_id in [0, 1]:
+            class_name = "Bag" if cls_id == 0 else "Intubator"
+            if prediction_frame_indices[cls_id]:  # Only plot if we have data
+                try:
+                    # Use the correct plotting function with proper parameters
+                    plot_binary_predictions_over_time(
+                        prediction_frame_indices[cls_id],  # Use frame indices directly
+                        prediction_answers[cls_id],
+                        "VLM and ROI", 
+                        prediction_questions[cls_id],
+                        class_name,
+                        save_dir=figures_dir,
+                        fps=fps,
+                        use_frame_indices=True  # Important: Tell the function to convert indices to time
+                    )
+                except Exception as e:
+                    print(f"Error plotting binary predictions for {class_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
     
-    # Create a base filename for figures based on the video name
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
-    figures_dir = f"./figures/{video_name}/roi"
-    os.makedirs(figures_dir, exist_ok=True)
+
     
     # Add debug printing to see what's in the prediction data
     for cls_id in [0, 1]:
@@ -508,233 +675,57 @@ def process_video_with_vlm_and_roi(video_path, model_path, output_path="output_w
         print(f"  Answers: {prediction_answers[cls_id]}")
         print(f"  Question: {prediction_questions[cls_id]}")
     
-    # Plot predictions for each class
-    for cls_id in [0, 1]:
-        class_name = "Bag" if cls_id == 0 else "Intubator"
-        if prediction_frame_indices[cls_id]:  # Only plot if we have data
-            try:
-                # Use the correct plotting function with proper parameters
-                plot_binary_predictions_over_time(
-                    prediction_frame_indices[cls_id],  # Use frame indices directly
-                    prediction_answers[cls_id],
-                    "VLM and ROI", 
-                    prediction_questions[cls_id],
-                    class_name,
-                    save_dir=figures_dir,
-                    fps=fps,
-                    use_frame_indices=True  # Important: Tell the function to convert indices to time
-                )
-            except Exception as e:
-                print(f"Error plotting binary predictions for {class_name}: {e}")
-                import traceback
-                traceback.print_exc()
+   
 
 
 
-def process_video_with_vlm_only(video_path, output_path="output_vlm_only.mp4", vlm_interval=30):
+def create_image_grid(images, max_images=4):
     """
-    Process a video with Moondream VLM only (no ROI detection),
-    asking the same question every N frames and showing results.
+    Create a grid of images to process as a single image.
     
     Args:
-        video_path (str): Path to the input video file.
-        output_path (str): Path to save the output video with annotations.
-        vlm_interval (int): Run VLM predictions every N frames.
+        images: List of PIL Image objects
+        max_images: Maximum number of images to include in grid
+        
+    Returns:
+        PIL Image containing a grid of the input images
     """
-    if not os.path.exists(video_path):
-        print(f"Error: Video not found at {video_path}")
-        return
+    images = images[:max_images]
+    n = len(images)
+    cols = min(2, n)
+    rows = (n + cols - 1) // cols
+    width = min(img.width for img in images)
+    height = min(img.height for img in images)
+    images = [img.resize((width, height)) for img in images]
+    grid_width = width * cols
+    grid_height = height * rows
+    grid = Image.new('RGB', (grid_width, grid_height))
+    for i, img in enumerate(images):
+        grid.paste(img, (width * (i % cols), height * (i // cols)))
+    return grid
 
-    # Open the video file
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Could not open video {video_path}")
-        return
+def process_image_grid(model, images, question):
+    """
+    Process multiple images by creating a grid and asking about it.
     
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    Args:
+        model: Moondream VLM model
+        images: List of PIL Image objects
+        question: Question to ask about the image sequence
+        
+    Returns:
+        Analysis of the image grid
+    """
+    grid = create_image_grid(images)
+    grid_prompt = f"This image shows a grid of {len(images)} sequential frames from a video. {question}"
+    return model.query(grid, grid_prompt)["answer"]
 
-    # Initialize video writer
-    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-
-    # The question to ask for every frame
-    question = "Is the bag getting pumped with air and squeezed by gloved fingers? Answer as 1 for yes, 0 for no."
-    
-    # Track the last answer
-    last_answer = "No inference yet"
-    
-    # Area for text at the bottom
-    text_area_height = 100
-    bottom_padding = 10
-
-    # Performance tracking
-    vlm_times = []
-    roi_times = []  # For compatibility with plot function (empty for VLM-only)
-    combined_times = []  # For compatibility with plot function
-    
-    # Track predictions and timestamps for plotting
-    prediction_timestamps = []
-    prediction_answers = []
-    prediction_questions = {0: question}  # For compatibility with other functions
-    cumulative_time = 0
-    video_time_timestamps = []  # Separate storage for video timestamps
-    
-    # Process frames
-    frame_idx = 0
-    print(f"Processing video: {video_path}")
-    print(f"Total frames: {total_frames}")
-    print(f"Running VLM every {vlm_interval} frames")
-    
-    # VLM time for non-inference frames (set to 0)
-    vlm_time = 0
-    prediction_frame_indices = []  # <-- Ensure this is initialized
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Create a copy of the frame for display
-        display_frame = frame.copy()
-        
-        # Run VLM at specified intervals
-        if frame_idx % vlm_interval == 0:
-            print(f"\nProcessing frame {frame_idx}/{total_frames} ({frame_idx/total_frames*100:.1f}%)")
-            
-            # Convert frame to PIL image for VLM
-            pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            
-            # Measure VLM inference time
-            start_time = time.time()
-            
-            # Run VLM query
-            answer = model.query(pil_image, question)["answer"]
-            last_answer = answer
-            
-            vlm_time = time.time() - start_time
-            vlm_times.append(vlm_time)
-            
-            # Store for plotting
-            cumulative_time += vlm_time
-            prediction_timestamps.append(cumulative_time)
-            prediction_answers.append(answer)
-            prediction_frame_indices.append(frame_idx)  # <-- Append frame index here
-            
-            # Also store video time (frame index / fps)
-            video_time = frame_idx / fps
-            video_time_timestamps.append(video_time)
-            
-            print(f"Frame {frame_idx}: Q: {question} A: {answer} ({vlm_time:.2f}s)")
-            
-            # Add empty ROI time for this frame
-            roi_times.append(0)
-             # Combined time is same as VLM time since ROI time is 0
-            combined_times.append(vlm_time)
-        else:
-            # For frames without inference, add zeros to keep arrays aligned
-            if len(vlm_times) > 0:  # Only if we've done at least one inference
-                vlm_times.append(0)
-                roi_times.append(0)
-                combined_times.append(0)
-        
-        # Create a dark semi-transparent overlay for text at the bottom
-        overlay = display_frame.copy()
-        cv2.rectangle(overlay, (0, height - text_area_height), (width, height), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, display_frame, 0.3, 0, display_frame)
-        
-        # Add inference results at the bottom
-        y_position = height - text_area_height + bottom_padding + 20
-        result_text = f"Q: {question}"
-        answer_text = f"A: {last_answer}"
-        
-        # Draw question and answer
-        cv2.putText(display_frame, result_text, (10, y_position), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(display_frame, answer_text, (10, y_position + 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Add frame number and processing info
-        status_text = f"Frame: {frame_idx}/{total_frames}"
-        if frame_idx % vlm_interval == 0:
-            status_text += f" (VLM: {vlm_time:.2f}s)"
-        
-        cv2.putText(display_frame, status_text, (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
-        # Write frame to video
-        writer.write(display_frame)
-        
-    # Display the frame
-        cv2.imshow('Video with VLM Only', display_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        
-        frame_idx += 1
-    
-    # Release resources
-    cap.release()
-    writer.release()
-    cv2.destroyAllWindows()
-
-    # Always plot binary predictions after processing
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
-    figures_dir = f"./figures/{video_name}/vlm_only"
-    os.makedirs(figures_dir, exist_ok=True)
-    try:
-        plot_binary_predictions_over_time(
-            prediction_frame_indices,
-            prediction_answers,
-            "VLM Only",
-            question,
-            save_dir=figures_dir,
-            fps=fps,
-            use_frame_indices=True
-        )
-    except Exception as e:
-        print(f"Error plotting binary predictions: {e}")
-
-    # Calculate average inference time
-    if vlm_times:
-        # Filter out zero values for average calculation
-        non_zero_vlm_times = [t for t in vlm_times if t > 0]
-        avg_vlm_time = sum(non_zero_vlm_times) / len(non_zero_vlm_times) if non_zero_vlm_times else 0
-        
-        print(f"Processing completed. Output saved to {output_path}.")
-        print(f"Average VLM inference time: {avg_vlm_time:.4f} seconds")
-        
-        # Create a base filename for figures based on the video name
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        figures_dir = f"./figures/{video_name}/vlm_only"
-        os.makedirs(figures_dir, exist_ok=True)
-        
-        try:
-            # Try to plot inference times
-            plot_inference_speeds(roi_times, non_zero_vlm_times, combined_times, save_dir=figures_dir)
-        except Exception as e:
-            print(f"Error plotting inference speeds: {e}")
-            
-        try:
-            # Try to plot VLM inference over time
-            plot_vlm_inference_over_time(non_zero_vlm_times, "VLM Only", save_dir=figures_dir)
-        except Exception as e:
-            print(f"Error plotting VLM inference over time: {e}")
-        
-        try:
-            # Create a dictionary with the results for plotting
-            results_data = {
-                'timestamps': prediction_timestamps,
-                'vlm_only_predictions': prediction_answers
-            }
-            
-            # Return both the inference times and results for plotting
-            return (vlm_times, prediction_timestamps, prediction_answers)
-        except Exception as e:
-            print(f"Error organizing results data: {e}")
-    else:
-        print("No frames were processed with VLM.")
-        return ([], [], [])
+# Example usage in your pipeline:
+# Suppose you have a list of PIL images (e.g., sampled every 15 frames)
+# images = [img1, img2, img3, img4]
+# question = "Describe how the bag is being squeezed over time. Is there a change in squeezing?"
+# answer = process_image_grid(model, images, question)
+# print(answer)
 
 # Example usage
 if __name__ == "__main__":
@@ -752,12 +743,108 @@ if __name__ == "__main__":
     # process_img_and_predict(test_image_path, "bag")
 
     # Process with ROI detection
-    roi_output_path = f"./output_with_roi_{video_name}_2b_multiframe_2.mp4"
-    process_video_with_vlm_and_roi(VIDEO_PATH, MODEL_PATH, output_path=roi_output_path)
+    roi_output_path = f"./output_with_roi_{video_name}_2b_grid.mp4"
+    process_video_with_vlm_and_roi(VIDEO_PATH, MODEL_PATH, output_path=roi_output_path, multi_frame = False, use_grid = False)
     
     # Process with VLM only
     # vlm_output_path = f"./output_vlm_only_{video_name}_0_5_b.mp4"
     # process_video_with_vlm_only(VIDEO_PATH, output_path=vlm_output_path)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

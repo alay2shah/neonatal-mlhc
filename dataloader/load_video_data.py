@@ -33,7 +33,7 @@ class VideoDataLoader:
         self.storage_client = storage.Client.create_anonymous_client()
         self.bucket = self.storage_client.bucket(bucket_name)
         print("Successfully connected to public GCS bucket")
-
+ 
     def list_videos(self, prefix="videos/"):
         """List all videos in the specified bucket folder."""
         try:
@@ -143,7 +143,7 @@ def main():
     """Example usage of the VideoDataLoader."""
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Extract random frames from videos in GCS bucket')
-    parser.add_argument('--num-frames', type=int, default=50,
+    parser.add_argument('--num-frames', type=int, default=150,
                       help='Total number of random frames to extract')
     parser.add_argument('--output-dir', type=str, 
                     #   default=str(Path.home() / 'neonatal-mlhc/testing_data'),
