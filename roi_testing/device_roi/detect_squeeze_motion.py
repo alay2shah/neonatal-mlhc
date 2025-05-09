@@ -8,32 +8,32 @@ import torch
 from models import YOLOv8Detector, track_with_lk_optical_flow
 
 class BagSqueezeDetector:
-    def __init__(self, model_path, squeeze_rate=40, window_size=15):
+    def __init__(self, model_path, squeeze_rate=40, window_size=30):  # Increased window size for better rhythm detection
         """
-        Initialize the bag squeeze detector with parameters optimized for pumping/contortion detection
+        Initialize the bag squeeze detector optimized for rhythmic bursts with reduced sensitivity
         
         Args:
             model_path: Path to YOLOv8 weights file for bag detection
-            squeeze_rate: Expected squeezes per minute (default now 60, approximately one per second)
-            window_size: Number of frames to analyze for rhythm detection
+            squeeze_rate: Expected squeezes per minute 
+            window_size: Number of frames to analyze for rhythm detection (increased)
         """
         # Load the YOLO model
         self.detector = YOLOv8Detector(model_path)
         
         # Parameters for squeeze detection
-        self.expected_rate = squeeze_rate  # 60 squeezes per minute (one per second)
-        self.window_size = window_size  # Frames to analyze for rhythm
+        self.expected_rate = squeeze_rate
+        self.window_size = window_size  # Increased for better rhythm detection
         self.motion_history = []  # Store motion values for analysis
         
         # Parameters for optical flow
         self.prev_gray = None
-        self.prev_roi_gray = None  # Add specific storage for ROI gray frame
-        self.roi = None  # Region of interest (where bag is detected)
+        self.prev_roi_gray = None
+        self.roi = None
         
         # Initialize detection state
         self.squeeze_active = False
         self.last_squeeze_frame = 0
-        self.min_frames_between_squeezes = 5  # Will be updated based on FPS
+        self.min_frames_between_squeezes = 15  # INCREASED: require more time between squeezes
         
         # For tracking compressions
         self.squeeze_count = 0
@@ -41,20 +41,38 @@ class BagSqueezeDetector:
         self.fps = 30  # Default, will be updated
         
         # Add tracking parameters
-        self.detection_interval = 15  # Run detection every 15 frames
-        self.tracked_boxes = []  # Track boxes between detections
+        self.detection_interval = 15
+        self.tracked_boxes = []
         
-        # Add parameters for continuous squeeze detection (optimized for pumping motions)
-        self.potential_squeeze_start = 0  # Frame when a potential squeeze began
-        self.continuous_squeeze_frames = 0  # Counter for continuous squeeze frames
-        self.squeeze_duration_threshold = 0.2  # Shorter duration threshold for quick pumps
-        self.squeeze_in_progress = True  # Tracking if we're in the middle of detecting a squeeze
-        self.motion_threshold = 15.0  # Threshold for complex motions
-        self.inactivity_counter = 0  # Counter for tracking inactivity after a squeeze
-        self.inactivity_threshold = 60  # How many frames of inactivity to end sustained detection
-        self.sustained_detection = True  # Flag for sustained detection state
-        self.max_sustained_duration = 1  # Maximum duration (seconds) without new motion
+        # Burst detection parameters - NEW
+        self.burst_threshold = 60.0  # Higher threshold for burst detection
+        self.burst_duration_frames = 0  # Counter for frames in a burst
+        self.min_burst_duration = 0.15  # Minimum duration of a burst (in seconds)
+        self.max_burst_duration = 0.5  # Maximum duration of a burst (in seconds)
+        self.burst_cooldown = 0  # Frames to wait after a burst
+        self.burst_in_progress = False  # Flag for burst detection
+        self.burst_peak_motion = 0  # Track peak motion during burst
         
+        # Rhythm detection - NEW
+        self.burst_timestamps = []  # Store timestamps of detected bursts
+        self.rhythm_detected = False  # Flag for detected rhythmic pattern
+        self.min_bursts_for_rhythm = 3  # Minimum bursts needed to detect rhythm
+        
+        # Very conservative detection parameters
+        self.motion_threshold = 30.0  # SIGNIFICANTLY INCREASED: much higher motion threshold
+        self.inactivity_threshold = 2
+        self.sustained_detection = False
+        self.inactivity_counter = 0
+        self.min_motion_for_activity = 10.0  # INCREASED: higher minimum for activity
+        
+        # Motion gap handling
+        self.last_significant_motion = 0
+        self.motion_gap_threshold = 0.3  # DECREASED: shorter gap detection
+        
+        # Parameters for the entire sequence
+        self.squeeze_sequence_active = False  # Overall sequence detection
+        self.sequence_start_time = 0  # When the current sequence started
+
     def set_fps(self, fps):
         """Set the frames per second for timing calculations and adjust thresholds accordingly"""
         self.fps = fps
@@ -204,114 +222,164 @@ class BagSqueezeDetector:
         return vis
         
     def analyze_motion(self, flow, frame_idx):
-        """Analyze flow to detect pumping/squeezing motions with better contortion detection"""
+        """Analyze flow to detect sudden rhythmic motion bursts with reduced sensitivity"""
         if flow is None:
-            # Reset continuous squeeze counter when no flow is available
-            self.continuous_squeeze_frames = 0
-            self.squeeze_in_progress = False
+            self.burst_in_progress = False
             self.sustained_detection = False
-            self.inactivity_counter = 0
+            self.inactivity_counter = self.inactivity_threshold
             return 0, False
+        
+        # Current time in seconds
+        current_time = frame_idx / self.fps
             
-        # Calculate overall motion in the ROI (not just directional)
+        # Calculate motion metrics
         flow_magnitude = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
         mean_motion = np.mean(flow_magnitude)
+        max_motion = np.max(flow_magnitude)
         
-        # Calculate motion complexity - variance in different directions
-        # Higher complexity indicates contortion/random movements rather than uniform motion
-        flow_complexity = np.std(flow_magnitude) 
-        
-        # Calculate directional components
+        # Directional components
         horizontal_motion = np.mean(np.abs(flow[..., 0]))
         vertical_motion = np.mean(np.abs(flow[..., 1]))
         
-        # Calculate directional changes - higher values mean more changing directions
-        h, w = flow.shape[:2]
-        center_region = flow[h//4:3*h//4, w//4:3*w//4]  # Focus on center
+        # Calculate motion complexity (variation in motion)
+        flow_complexity = np.std(flow_magnitude)
         
-        # Check for opposing directions in the flow (indicative of pumping)
+        # Calculate motion score focusing on sharp peaks and horizontal dominance
+        motion_score = (mean_motion * 1.0 + 
+                       max_motion * 2.0 +  # Emphasize peak motion for burst detection
+                       horizontal_motion * 3.0)  # Heavy emphasis on horizontal motion
+        
+        # Store for history analysis
+        self.motion_history.append(motion_score)
+        if len(self.motion_history) > self.window_size:
+            self.motion_history.pop(0)
+        
+        # Immediate return if motion is below minimum threshold
+        if mean_motion < self.min_motion_for_activity:
+            self.burst_in_progress = False
+            self.sustained_detection = False
+            return motion_score, False
+        
+        # Update last significant motion time
+        if motion_score > self.motion_threshold * 0.6:
+            self.last_significant_motion = current_time
+            
+        # Force end detection if no significant motion for too long
+        if self.sustained_detection and current_time - self.last_significant_motion > self.motion_gap_threshold:
+            print(f"Ending detection due to motion gap: {current_time - self.last_significant_motion:.2f}s")
+            self.sustained_detection = False
+            self.burst_in_progress = False
+            return motion_score, False
+        
+        # ---- BURST DETECTION LOGIC ----
+        # Burst detection cooldown
+        if self.burst_cooldown > 0:
+            self.burst_cooldown -= 1
+            
+        # Check for start of a new burst
+        if not self.burst_in_progress and self.burst_cooldown == 0:
+            if (motion_score > self.burst_threshold and 
+                horizontal_motion > vertical_motion * 2.0 and  # Strong horizontal dominance
+                self.verify_inward_motion(flow)):  # Verify squeezing pattern
+                
+                # Start tracking a new burst
+                self.burst_in_progress = True
+                self.burst_duration_frames = 1
+                self.burst_peak_motion = motion_score
+                print(f"Burst started at frame {frame_idx} with motion {motion_score:.2f}")
+            
+        # Track ongoing burst
+        elif self.burst_in_progress:
+            self.burst_duration_frames += 1
+            self.burst_peak_motion = max(self.burst_peak_motion, motion_score)
+            
+            # Check if burst has ended (duration or motion drop)
+            burst_duration_sec = self.burst_duration_frames / self.fps
+            
+            # End burst if it exceeded maximum duration or motion dropped significantly
+            if (burst_duration_sec > self.max_burst_duration or 
+                motion_score < self.burst_threshold * 0.4):
+                
+                # Check if this was a valid burst (met minimum duration)
+                valid_burst = burst_duration_sec >= self.min_burst_duration
+                
+                if valid_burst:
+                    # Record this as a successful burst
+                    self.burst_timestamps.append(current_time)
+                    print(f"Valid burst detected: duration={burst_duration_sec:.3f}s, peak={self.burst_peak_motion:.2f}")
+                    
+                    # Set cooldown period
+                    self.burst_cooldown = int(self.fps * 0.2)  # 200ms cooldown
+                    
+                    # Track as a squeeze if it was strong enough
+                    if self.burst_peak_motion > self.burst_threshold * 1.2:
+                        self.squeeze_count += 1
+                        self.squeeze_timestamps.append(current_time)
+                else:
+                    print(f"Burst too short: {burst_duration_sec:.3f}s")
+                    
+                # Reset burst tracking
+                self.burst_in_progress = False
+        
+        # ---- RHYTHM DETECTION LOGIC ----
+        # Check for rhythmic pattern in bursts
+        self.rhythm_detected = False
+        if len(self.burst_timestamps) >= self.min_bursts_for_rhythm:
+            # Calculate intervals between recent bursts
+            recent_bursts = self.burst_timestamps[-self.min_bursts_for_rhythm:]
+            intervals = np.diff(recent_bursts)
+            
+            # Calculate regularity metrics
+            if len(intervals) > 1:
+                avg_interval = np.mean(intervals)
+                # Check consistency (coefficient of variation)
+                cv = np.std(intervals) / avg_interval if avg_interval > 0 else float('inf')
+                
+                # If intervals are consistent enough, we have a rhythm
+                if cv < 0.3:  # Low variation = consistent rhythm
+                    burst_rate = 60.0 / avg_interval if avg_interval > 0 else 0
+                    within_expected_rate = abs(burst_rate - self.expected_rate) < 20
+                    
+                    if within_expected_rate:
+                        self.rhythm_detected = True
+                        print(f"Rhythm detected: rate={burst_rate:.1f}/min, consistency={cv:.2f}")
+        
+        # Determine if we should report a squeeze
+        # True if we're in a burst OR we've detected rhythm and are in sustained mode
+        squeeze_active = self.burst_in_progress or (self.rhythm_detected and self.sustained_detection)
+        
+        # Update sustained detection state
+        if self.burst_in_progress and not self.sustained_detection:
+            self.sustained_detection = True
+        elif self.sustained_detection and not self.burst_in_progress and not self.rhythm_detected:
+            self.inactivity_counter += 1
+            if self.inactivity_counter > self.inactivity_threshold:
+                self.sustained_detection = False
+        
+        return motion_score, squeeze_active
+
+    def verify_inward_motion(self, flow):
+        """Verify that the motion pattern truly represents a squeezing/inward motion"""
+        h, w = flow.shape[:2]
+        
+        # Calculate average motion in left and right halves
         left_region = flow[:, :w//2]
         right_region = flow[:, w//2:]
+        
+        # Compute average x direction (horizontal) motion
         left_x_motion = np.mean(left_region[..., 0])
         right_x_motion = np.mean(right_region[..., 0])
         
-        # Detect opposing horizontal movements (classic pumping pattern)
-        opposing_motion = (left_x_motion * right_x_motion < 0)
+        # For inward motion:
+        # - Left side should move rightward (positive x)
+        # - Right side should move leftward (negative x)
+        inward_pattern = (left_x_motion > 0.5) and (right_x_motion < -0.5)
         
-        # Calculate a pumping score that combines overall motion, complexity and opposing directions
-        pumping_score = (mean_motion * 3.0 + 
-                        flow_complexity * 2.0 + 
-                        (horizontal_motion + vertical_motion) * 1.0)
+        # Also check magnitude to ensure significant motion
+        motion_magnitude = np.abs(left_x_motion) + np.abs(right_x_motion)
         
-        if opposing_motion:
-            pumping_score *= 1.5  # Boost score if we detect opposing motions
-            
-        # Store this comprehensive motion value
-        self.motion_history.append(pumping_score)
-        
-        # Keep history to fixed window size
-        if len(self.motion_history) > self.window_size:
-            self.motion_history.pop(0)
-            
-        # Detect squeezing using adjusted thresholds for pumping motions
-        squeeze_detected = False
-        
-        # Only analyze if we have enough history
-        if len(self.motion_history) >= 5:
-            # Adjust threshold for pumping detection
-            motion_threshold = self.motion_threshold 
-            
-            # Look for any significant motion with complexity
-            is_potential_squeeze = pumping_score > motion_threshold
-            
-            # Handle sustained detection
-            if self.sustained_detection:
-                # End sustained detection when motion drops significantly
-                if pumping_score < motion_threshold * 0.35:  # Lower threshold for ending sustained detection
-                    self.inactivity_counter += 2
-                    
-                    # Very aggressive inactivity detection
-                    inactivity_threshold = min(self.inactivity_threshold, 2)
-                    
-                    if self.inactivity_counter >= inactivity_threshold:
-                        print(f"ENDING sustained detection - motion too low: {pumping_score:.4f}")
-                        self.sustained_detection = False
-                        self.inactivity_counter = 0
-                        return pumping_score, False
-                else:
-                    self.inactivity_counter = 0
-                    
-                # While in sustained detection, continue reporting squeeze as active
-                return pumping_score, True
-            
-            # Handle potential squeeze detection
-            if is_potential_squeeze:
-                if not self.squeeze_in_progress:
-                    self.potential_squeeze_start = frame_idx
-                    self.squeeze_in_progress = True
-                    self.continuous_squeeze_frames = 1
-                else:
-                    self.continuous_squeeze_frames += 1
-                
-                # Check if we've reached the duration threshold
-                squeeze_duration = self.continuous_squeeze_frames / self.fps
-                if squeeze_duration >= self.squeeze_duration_threshold:
-                    if frame_idx - self.last_squeeze_frame > self.min_frames_between_squeezes:
-                        squeeze_detected = True
-                        self.last_squeeze_frame = frame_idx
-                        self.squeeze_count += 1
-                        self.squeeze_timestamps.append(frame_idx / self.fps)
-                        
-                        # Enter sustained detection mode
-                        self.sustained_detection = True
-                        self.inactivity_counter = 0
-            else:
-                # Reset if motion stops
-                self.squeeze_in_progress = False
-                self.continuous_squeeze_frames = 0
-        
-        return pumping_score, squeeze_detected or self.sustained_detection
-    
+        return inward_pattern and motion_magnitude > 1.0
+
     def process_frame(self, frame, frame_idx):
         """Process a single frame to detect bag and squeezing motion"""
         # Make a copy for display
@@ -430,7 +498,7 @@ class BagSqueezeDetector:
                             # Position in top-right with margin
                             display_frame[10:10+h, display_frame.shape[1]-w-10:display_frame.shape[1]-10] = flow_vis
                             # Add squeeze duration information
-                            if self.squeeze_in_progress:
+                            if self.burst_in_progress:
                                 current_duration = self.continuous_squeeze_frames / self.fps
                                 duration_text = f"Squeeze duration: {current_duration:.1f}s / {self.squeeze_duration_threshold:.1f}s"
                                 duration_color = (0, 165, 255)  # Orange until threshold met
@@ -442,7 +510,7 @@ class BagSqueezeDetector:
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, duration_color, 2)
                             
                             # Show squeeze progress bar if in progress
-                            if self.squeeze_in_progress:
+                            if self.burst_in_progress:
                                 progress = min(1.0, self.continuous_squeeze_frames / (self.squeeze_duration_threshold * self.fps))
                                 bar_width = 150
                                 bar_height = 10
